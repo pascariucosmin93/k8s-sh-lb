@@ -13,6 +13,7 @@ SSH_USER="${SSH_USER:-root}"
 
 CONTROL_PLANE=""
 ENDPOINT=""
+CONTROL_PLANES_CSV=""
 WORKERS_CSV=""
 ROUTER_PEER=""
 ROUTER_ASN="65000"
@@ -23,10 +24,12 @@ LB_POOL_PRIVATE="203.0.113.0/24"
 usage() {
   cat <<EOF
 Usage:
-  $0 --control-plane <IP> --endpoint <IP> --workers <IP,IP,IP> [options]
+  $0 --control-plane <IP> --endpoint <IP> --control-planes <IP,IP> --workers <IP,IP,IP> [options]
 
 Options:
   --endpoint <IP>                 Load balancer IP for the HA API endpoint
+  --control-planes <IP,IP>        Additional control plane nodes
+  --workers <IP,IP,IP>            Worker nodes
   --ssh-user <USER>               SSH user for remote nodes
   --router-peer <IP>              FRR peer IP
   --router-asn <ASN>              Upstream router ASN
@@ -35,7 +38,7 @@ Options:
   --lb-pool-private <CIDR>        Cilium private LB pool
 
 Example:
-  $0 --control-plane 10.0.0.10 --endpoint 10.0.0.14 --workers 10.0.0.21,10.0.0.22 --router-peer 192.0.2.10
+  $0 --control-plane 10.0.0.10 --endpoint 10.0.0.14 --control-planes 10.0.0.15,10.0.0.16 --workers 10.0.0.21,10.0.0.22,10.0.0.23 --router-peer 192.0.2.10
 EOF
 }
 
@@ -56,6 +59,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --control-plane) CONTROL_PLANE="${2:-}"; shift 2 ;;
     --endpoint) ENDPOINT="${2:-}"; shift 2 ;;
+    --control-planes) CONTROL_PLANES_CSV="${2:-}"; shift 2 ;;
     --workers) WORKERS_CSV="${2:-}"; shift 2 ;;
     --ssh-user) SSH_USER="${2:-}"; shift 2 ;;
     --router-peer) ROUTER_PEER="${2:-}"; shift 2 ;;
@@ -70,8 +74,10 @@ done
 
 [[ -n "$CONTROL_PLANE" ]] || fail "--control-plane is required"
 [[ -n "$ENDPOINT" ]] || fail "--endpoint is required"
+[[ -n "$CONTROL_PLANES_CSV" ]] || fail "--control-planes is required"
 [[ -n "$WORKERS_CSV" ]] || fail "--workers is required"
 
+IFS=',' read -r -a CONTROL_PLANES <<< "$CONTROL_PLANES_CSV"
 IFS=',' read -r -a WORKERS <<< "$WORKERS_CSV"
 
 run_remote() {
@@ -203,16 +209,30 @@ join_control_planes() {
   certificate_key=$(run_remote "$CONTROL_PLANE" "sudo kubeadm init phase upload-certs --upload-certs | awk '/^[0-9a-f]{64}\$/{key=\$0} END{print key}'")
   [[ -n "$certificate_key" ]] || fail "Failed to retrieve kubeadm certificate key"
 
+  for node in "${CONTROL_PLANES[@]}"; do
+    log "Joining control plane node ${node}"
+    run_remote "$node" "sudo ${join_cmd} --control-plane --certificate-key ${certificate_key}"
+  done
+}
+
+join_workers() {
+  local join_cmd
+
+  join_cmd=$(run_remote "$CONTROL_PLANE" "sudo kubeadm token create --print-join-command")
+
   for worker in "${WORKERS[@]}"; do
-    log "Joining control plane node ${worker}"
-    run_remote "$worker" "sudo ${join_cmd} --control-plane --certificate-key ${certificate_key}"
+    log "Joining worker ${worker}"
+    run_remote "$worker" "sudo ${join_cmd}"
   done
 }
 
 main() {
   prepare_node "$CONTROL_PLANE"
-  for worker in "${WORKERS[@]}"; do
-    prepare_node "$worker"
+  for node in "${CONTROL_PLANES[@]}"; do
+    prepare_node "$node"
+  done
+  for node in "${WORKERS[@]}"; do
+    prepare_node "$node"
   done
 
   init_control_plane
@@ -225,6 +245,7 @@ main() {
   fi
 
   join_control_planes
+  join_workers
 
   log "Cluster bootstrap complete"
   warn "Run 'kubectl get nodes -o wide' and 'kubectl -n kube-system exec ds/cilium -- cilium status --verbose' to validate the cluster"
