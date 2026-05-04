@@ -111,12 +111,13 @@ net.bridge.bridge-nf-call-ip6tables = 1
 net.ipv4.ip_forward                 = 1
 SYSCTL
 
-sysctl --system >/dev/null
+# Apply only the Kubernetes sysctl settings to avoid unrelated host warnings.
+sysctl -p /etc/sysctl.d/k8s.conf >/dev/null
 
 apt-get update -qq
 apt-get install -y -qq apt-transport-https ca-certificates curl gnupg lsb-release conntrack >/dev/null
 
-apt-get remove -y containerd 2>/dev/null || true
+apt-get remove -y -qq containerd >/dev/null 2>&1 || true
 
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg | tee /etc/apt/keyrings/docker.asc >/dev/null
