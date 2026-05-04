@@ -12,6 +12,7 @@ POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
 SSH_USER="${SSH_USER:-root}"
 
 CONTROL_PLANE=""
+ENDPOINT=""
 WORKERS_CSV=""
 ROUTER_PEER=""
 ROUTER_ASN="65000"
@@ -22,9 +23,10 @@ LB_POOL_PRIVATE="203.0.113.0/24"
 usage() {
   cat <<EOF
 Usage:
-  $0 --control-plane <IP> --workers <IP,IP,IP> [options]
+  $0 --control-plane <IP> --endpoint <IP> --workers <IP,IP,IP> [options]
 
 Options:
+  --endpoint <IP>                 Load balancer IP for the HA API endpoint
   --ssh-user <USER>               SSH user for remote nodes
   --router-peer <IP>              FRR peer IP
   --router-asn <ASN>              Upstream router ASN
@@ -33,7 +35,7 @@ Options:
   --lb-pool-private <CIDR>        Cilium private LB pool
 
 Example:
-  $0 --control-plane 10.0.0.10 --workers 10.0.0.21,10.0.0.22,10.0.0.23 --router-peer 192.0.2.10
+  $0 --control-plane 10.0.0.10 --endpoint 10.0.0.14 --workers 10.0.0.21,10.0.0.22 --router-peer 192.0.2.10
 EOF
 }
 
@@ -53,6 +55,7 @@ fail() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --control-plane) CONTROL_PLANE="${2:-}"; shift 2 ;;
+    --endpoint) ENDPOINT="${2:-}"; shift 2 ;;
     --workers) WORKERS_CSV="${2:-}"; shift 2 ;;
     --ssh-user) SSH_USER="${2:-}"; shift 2 ;;
     --router-peer) ROUTER_PEER="${2:-}"; shift 2 ;;
@@ -66,6 +69,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$CONTROL_PLANE" ]] || fail "--control-plane is required"
+[[ -n "$ENDPOINT" ]] || fail "--endpoint is required"
 [[ -n "$WORKERS_CSV" ]] || fail "--workers is required"
 
 IFS=',' read -r -a WORKERS <<< "$WORKERS_CSV"
@@ -137,7 +141,7 @@ REMOTE_EOF
 
 init_control_plane() {
   log "Initializing control plane on ${CONTROL_PLANE}"
-  run_remote "$CONTROL_PLANE" "sudo kubeadm init --apiserver-advertise-address=${CONTROL_PLANE} --pod-network-cidr=${POD_CIDR} --skip-phases=addon/kube-proxy --ignore-preflight-errors=NumCPU,Mem"
+  run_remote "$CONTROL_PLANE" "sudo kubeadm init --apiserver-advertise-address=${CONTROL_PLANE} --control-plane-endpoint=${ENDPOINT}:6443 --upload-certs --pod-network-cidr=${POD_CIDR} --skip-phases=addon/kube-proxy --ignore-preflight-errors=NumCPU,Mem"
   run_remote "$CONTROL_PLANE" 'mkdir -p $HOME/.kube && sudo cp -f /etc/kubernetes/admin.conf $HOME/.kube/config && sudo chown $(id -u):$(id -g) $HOME/.kube/config'
 }
 
@@ -146,7 +150,7 @@ install_cilium() {
   run_remote "$CONTROL_PLANE" "curl -sL https://github.com/cilium/cilium-cli/releases/latest/download/cilium-linux-amd64.tar.gz | sudo tar xz -C /usr/local/bin"
   run_remote "$CONTROL_PLANE" "curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | sudo bash"
   run_remote "$CONTROL_PLANE" "helm repo add cilium https://helm.cilium.io/ && helm repo update"
-  run_remote "$CONTROL_PLANE" "helm install cilium cilium/cilium --version ${CILIUM_VERSION} --namespace kube-system --create-namespace --set kubeProxyReplacement=true --set k8sServiceHost=${CONTROL_PLANE} --set k8sServicePort=6443 --set bgpControlPlane.enabled=true --set ipam.mode=kubernetes --set gatewayAPI.enabled=true --set hubble.enabled=true --set hubble.relay.enabled=true --set hubble.ui.enabled=true"
+  run_remote "$CONTROL_PLANE" "helm install cilium cilium/cilium --version ${CILIUM_VERSION} --namespace kube-system --create-namespace --set kubeProxyReplacement=true --set k8sServiceHost=${ENDPOINT} --set k8sServicePort=6443 --set bgpControlPlane.enabled=true --set ipam.mode=kubernetes --set gatewayAPI.enabled=true --set hubble.enabled=true --set hubble.relay.enabled=true --set hubble.ui.enabled=true"
 }
 
 configure_cilium() {
@@ -191,12 +195,17 @@ EOF
   run_remote "$CONTROL_PLANE" "kubectl apply -f /tmp/cilium-networking.yaml"
 }
 
-join_workers() {
+join_control_planes() {
   local join_cmd
+  local certificate_key
+
   join_cmd=$(run_remote "$CONTROL_PLANE" "sudo kubeadm token create --print-join-command")
+  certificate_key=$(run_remote "$CONTROL_PLANE" "sudo kubeadm init phase upload-certs --upload-certs | awk '/^[0-9a-f]{64}\$/{key=\$0} END{print key}'")
+  [[ -n "$certificate_key" ]] || fail "Failed to retrieve kubeadm certificate key"
+
   for worker in "${WORKERS[@]}"; do
-    log "Joining worker ${worker}"
-    run_remote "$worker" "sudo ${join_cmd}"
+    log "Joining control plane node ${worker}"
+    run_remote "$worker" "sudo ${join_cmd} --control-plane --certificate-key ${certificate_key}"
   done
 }
 
@@ -215,11 +224,10 @@ main() {
     warn "Skipping BGP and LB IPAM manifest generation because --router-peer was not provided"
   fi
 
-  join_workers
+  join_control_planes
 
   log "Cluster bootstrap complete"
   warn "Run 'kubectl get nodes -o wide' and 'kubectl -n kube-system exec ds/cilium -- cilium status --verbose' to validate the cluster"
 }
 
 main
-
